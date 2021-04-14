@@ -1,0 +1,12 @@
+{
+  "name": "rtc",
+  "displayName": "rtc",
+  "expo": {
+    "name": "rtc",
+    "slug": "rtc",
+    "version": "1.0.0",
+    "assetBundlePatterns": [
+      "**/*"
+    ]
+  }
+}
