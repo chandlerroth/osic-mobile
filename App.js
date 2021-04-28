@@ -1,127 +1,167 @@
-import React from 'react';
+import React, {useState} from 'react';
 import * as Permissions from 'expo-permissions';
 import {View, SafeAreaView, Button, StyleSheet} from 'react-native';
-
 import {RTCPeerConnection, mediaDevices} from 'react-native-webrtc';
+import {Base64, rpc, uuidv4} from './utilities'
 
 export default function App() {
-  const [localStream, setLocalStream] = React.useState();
-  const [remoteStream, setRemoteStream] = React.useState();
-  const [cachedLocalPC, setCachedLocalPC] = React.useState();
-  const [cachedRemotePC, setCachedRemotePC] = React.useState();
-  const [microphonePermission, askMicrophonePermission, getMicrophonePermission] = Permissions.usePermissions(Permissions.AUDIO_RECORDING, { ask: true });
+  const [cachedStream, setCachedStream] = useState();
+  const [cachedLocalPeerConnection, setCachedLocalPeerConnection] = useState();
+  const [localTrack, setLocalTrack] = useState();
+  const [uid] = useState(uuidv4())
+  const [isMuted, setIsMuted] = useState(false);
+  const [microphonePermission, askMicrophonePermission] = Permissions.usePermissions(Permissions.AUDIO_RECORDING, { ask: true });
 
-  const [isMuted, setIsMuted] = React.useState(false);
+  const ICE_POLICY = 'relay';
+
+  const room = 'test';
+  const name = 'native';
+  const username = `${uid}:${Base64.encode(name)}`;
+
+  const encodedRoom = encodeURIComponent(room);
+  const encodedUsername = encodeURIComponent(username);
+
+  console.log('uid', uid)
+  console.log('username', username)
+  console.log('encodedRoom', encodedRoom)
+  console.log('encodedUsername', encodedUsername)
+  console.log('localTrack', localTrack)
 
   if (!microphonePermission) {
     console.log(microphonePermission)
     askMicrophonePermission()
   }
 
-  const startLocalStream = async () => {
-    const constraints = {
-      audio: true,
-    };
-    const newStream = await mediaDevices.getUserMedia(constraints);
-    setLocalStream(newStream);
-    console.log('Started new stream:', newStream)
-  };
+  async function getRtcPeerConfiguration () {
+    const res = await rpc('turn', [encodedUsername]);
+    console.log(res)
 
-  const startCall = async () => {
-    // You'll most likely need to use a STUN server at least. Look into TURN and decide if that's necessary for your project
-    const configuration = {iceServers: [{url: 'stun:stun.l.google.com:19302'}]};
-    const localPC = new RTCPeerConnection(configuration);
-    const remotePC = new RTCPeerConnection(configuration);
-
-    // could also use "addEventListener" for these callbacks, but you'd need to handle removing them as well
-    localPC.onicecandidate = e => {
-      try {
-        console.log('localPC icecandidate:', e.candidate);
-        if (e.candidate) {
-          remotePC.addIceCandidate(e.candidate);
-        }
-      } catch (err) {
-        console.error(`Error adding remotePC iceCandidate: ${err}`);
-      }
-    };
-    localPC
-    remotePC.onicecandidate = e => {
-      try {
-        console.log('remotePC icecandidate:', e.candidate);
-        if (e.candidate) {
-          localPC.addIceCandidate(e.candidate);
-        }
-      } catch (err) {
-        console.error(`Error adding localPC iceCandidate: ${err}`);
-      }
-    };
-    remotePC.onaddstream = e => {
-      console.log('remotePC tracking with ', e);
-      if (e.stream && remoteStream !== e.stream) {
-        console.log('RemotePC received the stream', e.stream);
-        setRemoteStream(e.stream);
-      }
+    const configuration = {
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      sdpSemantics: 'unified-plan'
     };
 
+    if (ICE_POLICY === 'relay' && res.data && res.data.length > 0) {
+      configuration.iceServers = res.data;
+      configuration.iceTransportPolicy = 'relay';
+    } else {
+      configuration.iceServers = [];
+      configuration.iceTransportPolicy = 'all';
+    }
+
+    console.log('CONFIGURATION', configuration)
+
+    return configuration;
+  }
+
+  async function setupRtcPeerConnection () {
+    const localPeerConnection = new RTCPeerConnection(await getRtcPeerConfiguration());
+    // localPeerConnection.onicecandidate = onIceCandidate
+    // localPeerConnection.ontrack = onTrack // ontrack event listener is not supported by react-native-webrtc
+    const stream = await setupStream(localPeerConnection)
+    await connect(localPeerConnection)
+    return { localPeerConnection, stream }
+  }
+
+  async function setupStream (localPeerConnection) {
+    const stream = await mediaDevices.getUserMedia({ audio: true, video: false });
     // AddTrack not supported yet, so have to use old school addStream instead
     // newStream.getTracks().forEach(track => localPC.addTrack(track, newStream));
-    localPC.addStream(localStream);
-    try {
-      const offer = await localPC.createOffer();
-      console.log('Offer from localPC, setLocalDescription');
-      await localPC.setLocalDescription(offer);
-      console.log('remotePC, setRemoteDescription');
-      await remotePC.setRemoteDescription(localPC.localDescription);
-      console.log('RemotePC, createAnswer');
-      const answer = await remotePC.createAnswer();
-      console.log(`Answer from remotePC: ${answer.sdp}`);
-      console.log('remotePC, setLocalDescription');
-      await remotePC.setLocalDescription(answer);
-      console.log('localPC, setRemoteDescription');
-      await localPC.setRemoteDescription(remotePC.localDescription);
-    } catch (err) {
-      console.error(err);
-    }
-    setCachedLocalPC(localPC);
-    setCachedRemotePC(remotePC);
-  };
+    localPeerConnection.addStream(stream);
+    return stream;
+  }
 
-  // Mutes the local's outgoing audio
   const toggleMute = () => {
-    if (!remoteStream) return;
-    localStream.getAudioTracks().forEach(track => {
+    cachedStream.getAudioTracks().forEach(track => {
       console.log(track.enabled ? 'muting' : 'unmuting', ' local track', track);
       track.enabled = !track.enabled;
       setIsMuted(!track.enabled);
     });
   };
 
-  const closeStreams = () => {
-    if (cachedLocalPC) {
-      cachedLocalPC.removeStream(localStream);
-      cachedLocalPC.close();
+  const startCall = async () => {
+    try {
+      const {localPeerConnection, stream} = await setupRtcPeerConnection()
+      console.log(localPeerConnection)
+      console.log(stream)
+      setCachedStream(stream);
+      setCachedLocalPeerConnection(localPeerConnection);
+      console.log('STARTED CALL')
+    } catch (err) {
+      console.log(err)
     }
-    if (cachedRemotePC) {
-      cachedRemotePC.removeStream(remoteStream);
-      cachedRemotePC.close();
+  };
+
+  const endCall = () => {
+    if (cachedLocalPeerConnection) {
+      cachedLocalPeerConnection.removeStream(cachedStream);
+      cachedLocalPeerConnection.close();
     }
-    setLocalStream();
-    setRemoteStream();
-    setCachedRemotePC();
-    setCachedLocalPC();
+    setCachedStream();
+    setCachedLocalPeerConnection();
+    console.log('ENDED CALL')
+  };
+
+  async function connect(localPeerConnection) {
+    const offer = await localPeerConnection.createOffer();
+    console.log('OFFER', offer)
+    await localPeerConnection.setLocalDescription(offer);
+    publish(localPeerConnection)
+  }
+
+  async function subscribe(localPeerConnection, localTrack) {
+    console.log('subscribing...')
+    const response = await rpc('subscribe', [encodedRoom, encodedUsername, localTrack]);
+    if (response.error && typeof response.error === 'string' && response.error.indexOf(encodedUsername + ' not found in')) {
+      localPeerConnection.close();
+      await start();
+      return;
+    }
+    if (response.data) {
+      var jsep = JSON.parse(response.data.jsep);
+      if (jsep.type == 'offer') {
+        await localPeerConnection.setRemoteDescription(jsep);
+        var sdp = await localPeerConnection.createAnswer();
+        await localPeerConnection.setLocalDescription(sdp);
+        await rpc('answer', [encodedRoom, encodedUsername, localTrack, JSON.stringify(sdp)]);
+      }
+    }
+    setTimeout(function () {
+      if (cachedLocalPeerConnection) {
+        subscribe(cachedLocalPeerConnection, localTrack);
+      }
+    }, 3000);
+  }
+
+  async function publish (localPeerConnection) {
+    const res = await rpc('publish', [encodedRoom, encodedUsername, JSON.stringify(localPeerConnection.localDescription)]);
+    if (res.data) {
+      const jsep = JSON.parse(res.data.jsep);
+      if (jsep.type == 'answer') {
+        await localPeerConnection.setRemoteDescription(jsep);
+        const localTrack = res.data.track;
+        setLocalTrack(localTrack);
+        console.log('LOCAL TRACK', res.data.track)
+        localPeerConnection.onicecandidate = ({candidate}) => onIceCandidate(candidate, localTrack)
+        subscribe(localPeerConnection, localTrack);
+      }
+    }
+  }
+
+  function onIceCandidate (candidate, localTrack) {
+    rpc('trickle', [encodedRoom, encodedUsername, localTrack, JSON.stringify(candidate)]);
   };
 
   return (
     <SafeAreaView style={styles.container}>
-      {!localStream && <Button title="Click to start stream" onPress={startLocalStream} />}
-      {localStream && <Button title="Click to start call" onPress={startCall} disabled={!!remoteStream} />}
-
-      {localStream && (
+      {cachedStream && (
         <View style={styles.toggleButtons}>
-          <Button title={`${isMuted ? 'Unmute' : 'Mute'} stream`} onPress={toggleMute} disabled={!remoteStream} />
+          <Button title={`${isMuted ? 'Unmute' : 'Mute'} stream`} onPress={toggleMute} />
         </View>
       )}
-      <Button title="Click to stop call" onPress={closeStreams} disabled={!remoteStream} />
+      <Button title="Join" onPress={startCall} />
+      <Button title="Leave" onPress={endCall} />
     </SafeAreaView>
   );
 }
